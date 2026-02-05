@@ -17,7 +17,7 @@ FILTER_RC_DEFAULT = 200
 FILTER_RC_MAX = 1000
 
 
-def _nothing(x):
+def nothing(x):
     pass
 
 
@@ -30,7 +30,7 @@ def setup():
         WINDOW_NAME,
         MAX_FEATURES_DEFAULT,
         MAX_FEATURES_MAX,
-        _nothing,
+        nothing,
     )
 
     cv2.createTrackbar(
@@ -38,7 +38,7 @@ def setup():
         WINDOW_NAME,
         FILTER_RC_DEFAULT,
         FILTER_RC_MAX,
-        _nothing,
+        nothing,
     )
 
 

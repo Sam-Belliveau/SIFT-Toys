@@ -1,17 +1,16 @@
 """
-Optimal Transport Point Matching
+Point Matching Across Frames
 Uses: nothing
 Used by: main.py
 
-Matches current keypoints to previous keypoints using
-linear sum assignment (Hungarian algorithm).
+Matches current keypoints to previous keypoints for tracking.
 """
 
 import numpy as np
 from scipy import optimize
 
 
-def _distance_matrix(points_a, points_b):
+def distance_matrix(points_a, points_b):
     """Compute pairwise Euclidean distances between two point sets."""
     diff = points_a[:, np.newaxis, :] - points_b[np.newaxis, :, :]
     return np.sqrt((diff**2).sum(axis=2))
@@ -19,7 +18,7 @@ def _distance_matrix(points_a, points_b):
 
 def match_points(current_points, previous_points):
     """
-    Match current keypoints to previous keypoints using optimal transport.
+    Match current keypoints to previous keypoints.
 
     Returns matched previous points in same order as current,
     or current points if no previous history.
@@ -30,7 +29,7 @@ def match_points(current_points, previous_points):
     if len(current_points) == 0:
         return previous_points
 
-    cost_matrix = _distance_matrix(current_points, previous_points)
+    cost_matrix = distance_matrix(current_points, previous_points)
 
     row_indices, col_indices = optimize.linear_sum_assignment(cost_matrix)
 
