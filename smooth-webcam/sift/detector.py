@@ -1,72 +1,59 @@
 """
-SIFT Feature Detector (GPU)
+SIFT Feature Detector (CPU)
 Uses: profiler
 Used by: main.py
 
-Kornia SIFT with MPS compatibility via grid_sample patch.
+OpenCV SIFT - fast, optimized C++.
 """
 
-import torch
-import torch.nn.functional as F
-import kornia.feature as KF
+import cv2
+import numpy as np
 from profiler import profiler
 
 # === PARAMETERS ===
 DEFAULT_MAX_FEATURES = 64
-DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-
-# Patch grid_sample to use 'zeros' instead of 'border' for MPS compatibility
-original_grid_sample = F.grid_sample
-
-
-def patched_grid_sample(
-    input,
-    grid,
-    mode="bilinear",
-    padding_mode="zeros",
-    align_corners=None,
-):
-    if padding_mode == "border":
-        padding_mode = "zeros"
-    return original_grid_sample(
-        input,
-        grid,
-        mode=mode,
-        padding_mode=padding_mode,
-        align_corners=align_corners,
-    )
-
-
-F.grid_sample = patched_grid_sample
 
 
 class SIFTDetector:
-    """GPU-accelerated SIFT detector."""
+    """CPU-based SIFT detector using OpenCV."""
 
     def __init__(self):
-        self.detector = KF.SIFTFeature(num_features=DEFAULT_MAX_FEATURES).to(DEVICE)
+        self.detector = cv2.SIFT_create(nfeatures=DEFAULT_MAX_FEATURES)
         self.max_features = DEFAULT_MAX_FEATURES
 
     def detect(
         self,
-        gray_tensor,
+        gray,
         max_features=DEFAULT_MAX_FEATURES,
     ):
-        """Extract SIFT keypoints and descriptors."""
+        """
+        Extract SIFT keypoints and descriptors.
+
+        Args:
+            gray: HxW uint8 numpy array
+            max_features: Maximum number of features to detect
+
+        Returns:
+            (keypoints, descriptors):
+                - keypoints: Nx2 float32 array as (y, x)
+                - descriptors: NxD float32 array
+        """
         with profiler.section("rebuild_detector"):
             if max_features != self.max_features:
-                self.detector = KF.SIFTFeature(num_features=max_features).to(DEVICE)
+                self.detector = cv2.SIFT_create(nfeatures=max_features)
                 self.max_features = max_features
 
-        with profiler.section("kornia_detect"):
-            with torch.no_grad():
-                lafs, responses, descriptors = self.detector(gray_tensor)
+        with profiler.section("opencv_detect"):
+            kps, descriptors = self.detector.detectAndCompute(gray, None)
 
-        with profiler.section("extract_keypoints"):
-            if lafs.shape[1] == 0:
-                return torch.zeros((0, 2), device=DEVICE), None
+        with profiler.section("convert_keypoints"):
+            if kps is None or len(kps) == 0:
+                return np.zeros((0, 2), dtype=np.float32), None
 
-            keypoints_xy = lafs[0, :, :, 2]
-            keypoints = torch.flip(keypoints_xy, dims=[1])
+            # OpenCV keypoints are (x, y), convert to (y, x)
+            keypoints = np.array(
+                [[kp.pt[1], kp.pt[0]] for kp in kps],
+                dtype=np.float32,
+            )
 
-        return keypoints, descriptors[0]
+        return keypoints, descriptors

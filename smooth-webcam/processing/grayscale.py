@@ -1,24 +1,22 @@
 """
-Grayscale Conversion (GPU)
+Grayscale Conversion (CPU)
 Uses: nothing
 Used by: main.py
+
+Simple grayscale conversion using OpenCV.
 """
 
-import torch
-import kornia.color as KC
-
-# === PARAMETERS ===
-DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+import cv2
 
 
-def convert(image_tensor):
+def convert(image):
     """
-    Convert RGB tensor to grayscale.
+    Convert BGR image to grayscale.
 
     Args:
-        image_tensor: [B, 3, H, W] float tensor
+        image: HxWx3 uint8 BGR numpy array
 
     Returns:
-        [B, 1, H, W] float tensor (grayscale)
+        HxW uint8 grayscale numpy array
     """
-    return KC.rgb_to_grayscale(image_tensor)
+    return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)

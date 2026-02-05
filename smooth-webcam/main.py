@@ -1,60 +1,31 @@
 """
-Smooth Webcam - GPU Accelerated SIFT Feature Tracking
+Smooth Webcam - CPU-based SIFT Feature Tracking
 
-Main orchestrator.
-
-CPU transfers (justified):
-  1. Camera capture -> tensor: Unavoidable, camera outputs numpy
-  2. Tensor -> display: Unavoidable, cv2.imshow needs numpy
-  3. RBF interpolation: scipy has no GPU support
+Main orchestrator with downsampling for performance.
 """
 
 import time
-import torch
 import cv2
 
 from frontend import video_capture, interface, display
 from sift.detector import SIFTDetector
-from processing import grayscale, image_warp, gpu_utils
+from processing import grayscale, image_warp, draw
 from processing.feature_tracker import FeatureTracker
 from profiler import profiler
 
 # === PARAMETERS ===
-DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 MIN_FEATURES = 4
+DOWNSAMPLE_FACTOR = 4  # Process at 1/4 resolution
 
-# Colors for GPU drawing (RGB, 0-1)
-COLOR_RED = torch.tensor([1.0, 0.0, 0.0], device=DEVICE)
-COLOR_GREEN = torch.tensor([0.0, 1.0, 0.0], device=DEVICE)
-COLOR_WHITE = torch.tensor([1.0, 1.0, 1.0], device=DEVICE)
-
-
-def frame_to_tensor(frame):
-    """CPU->GPU transfer: Unavoidable, camera outputs numpy."""
-    with profiler.section("bgr_to_rgb"):
-        rgb = frame[:, :, ::-1].copy()
-    with profiler.section("to_device"):
-        tensor = torch.from_numpy(rgb).float().to(DEVICE) / 255.0
-    with profiler.section("permute"):
-        tensor = tensor.permute(2, 0, 1).unsqueeze(0)
-    return tensor
-
-
-def tensor_to_frame(tensor):
-    """GPU->CPU transfer: Unavoidable, cv2.imshow needs numpy."""
-    with profiler.section("permute"):
-        rgb = tensor[0].permute(1, 2, 0)
-    with profiler.section("to_cpu"):
-        rgb = rgb.cpu().numpy()
-    with profiler.section("to_uint8"):
-        rgb = (rgb * 255).astype("uint8")
-    with profiler.section("rgb_to_bgr"):
-        bgr = rgb[:, :, ::-1].copy()
-    return bgr
+# Colors in BGR
+COLOR_RED = (0, 0, 255)
+COLOR_GREEN = (0, 255, 0)
+COLOR_WHITE = (255, 255, 255)
 
 
 def main():
-    print(f"Using device: {DEVICE}")
+    print(f"Running on CPU with {DOWNSAMPLE_FACTOR}x downsampling")
+    print("Press 'q' or ESC to quit, or close the window")
 
     camera = video_capture.get_stream()
     sift = SIFTDetector()
@@ -77,18 +48,20 @@ def main():
 
             max_features, rc_ms = interface.read_params()
 
-            with profiler.section("to_tensor"):
-                img_tensor = frame_to_tensor(frame)
+            # Downsample for faster processing
+            with profiler.section("downsample"):
+                h, w = frame.shape[:2]
+                small_h, small_w = h // DOWNSAMPLE_FACTOR, w // DOWNSAMPLE_FACTOR
+                small_frame = cv2.resize(frame, (small_w, small_h))
 
             with profiler.section("grayscale"):
-                gray_tensor = grayscale.convert(img_tensor)
+                gray = grayscale.convert(small_frame)
 
             with profiler.section("sift"):
-                keypoints, descriptors = sift.detect(gray_tensor, max_features)
+                keypoints, descriptors = sift.detect(gray, max_features)
 
             if keypoints.shape[0] < MIN_FEATURES:
-                output = tensor_to_frame(img_tensor)
-                display.show(output)
+                display.show(frame)
                 profiler.report()
                 continue
 
@@ -96,27 +69,30 @@ def main():
                 detected, tracked = tracker.update(keypoints, descriptors, dt, rc_ms)
 
             if detected.shape[0] < MIN_FEATURES:
-                output = tensor_to_frame(img_tensor)
-                display.show(output)
+                display.show(frame)
                 profiler.report()
                 continue
 
+            # Warp at small resolution
             with profiler.section("warp"):
-                warped_tensor = image_warp.warp_image(img_tensor, detected, tracked)
+                warped_small = image_warp.warp_image(small_frame, detected, tracked)
 
+            # Upsample result
+            with profiler.section("upsample"):
+                warped = cv2.resize(warped_small, (w, h))
+
+            # Scale points for drawing at full resolution
+            with profiler.section("scale_points"):
+                detected_full = detected * DOWNSAMPLE_FACTOR
+                tracked_full = tracked * DOWNSAMPLE_FACTOR
+
+            # Draw overlay
             with profiler.section("draw"):
-                output_tensor = gpu_utils.draw_lines(
-                    warped_tensor, detected, tracked, COLOR_WHITE
+                output = draw.draw_lines(
+                    warped, detected_full, tracked_full, COLOR_WHITE
                 )
-                output_tensor = gpu_utils.draw_points(
-                    output_tensor, detected, COLOR_RED, radius=3
-                )
-                output_tensor = gpu_utils.draw_points(
-                    output_tensor, tracked, COLOR_GREEN, radius=3
-                )
-
-            with profiler.section("to_frame"):
-                output = tensor_to_frame(output_tensor)
+                output = draw.draw_points(output, detected_full, COLOR_RED, radius=3)
+                output = draw.draw_points(output, tracked_full, COLOR_GREEN, radius=3)
 
             with profiler.section("display"):
                 if not display.show(output):

@@ -1,77 +1,72 @@
 """
-Image Warp (GPU)
-Uses: processing/gpu_utils, profiler
+Image Warp (CPU)
+Uses: profiler
 Used by: main.py
 
-GPU image warping. RBF interpolation must be on CPU (scipy limitation),
-but the actual grid_sample warp is on GPU.
+Linear interpolation-based image warping using scipy Delaunay triangulation.
 """
 
-import torch
+import cv2
 import numpy as np
-from scipy import interpolate
-from processing import gpu_utils
+from scipy.interpolate import LinearNDInterpolator
 from profiler import profiler
-
-# === PARAMETERS ===
-DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-SMOOTHING = 10.0
 
 
 def warp_image(
-    image_tensor,
+    image,
     source_points,
     destination_points,
 ):
     """
-    Warp image using displacement field.
+    Warp image using linear interpolation displacement field.
 
-    CPU transfer justification:
-        - scipy.interpolate.RBFInterpolator has no GPU implementation
-        - Points are small (N~64), transfer is negligible
-        - Flow field (H*W*2) computed on CPU then sent to GPU once
+    Args:
+        image: HxWxC uint8 numpy array
+        source_points: Nx2 array (y, x) - detected positions
+        destination_points: Nx2 array (y, x) - tracked positions
     """
-    _, _, h, w = image_tensor.shape
+    h, w = image.shape[:2]
 
-    with profiler.section("to_cpu"):
-        src_np = source_points.detach().cpu().numpy()
-        dst_np = destination_points.detach().cpu().numpy()
-
-    if np.any(np.isnan(src_np)) or np.any(np.isnan(dst_np)):
-        return image_tensor
+    with profiler.section("nan_check"):
+        if np.any(np.isnan(source_points)) or np.any(np.isnan(destination_points)):
+            return image
 
     with profiler.section("displacement"):
-        displacements = dst_np - src_np
+        displacements = destination_points - source_points
 
-    with profiler.section("rbf_create"):
+    with profiler.section("interpolator"):
         try:
-            interpolator = interpolate.RBFInterpolator(
-                src_np,
-                displacements,
-                smoothing=SMOOTHING,
+            # Add corners to ensure full coverage
+            corners = np.array(
+                [[0, 0], [0, w - 1], [h - 1, 0], [h - 1, w - 1]], dtype=np.float32
             )
-        except (ValueError, np.linalg.LinAlgError):
-            return image_tensor
+            corner_disp = np.zeros((4, 2), dtype=np.float32)
+
+            all_points = np.vstack([source_points, corners])
+            all_disps = np.vstack([displacements, corner_disp])
+
+            interpolator = LinearNDInterpolator(all_points, all_disps, fill_value=0)
+        except Exception:
+            return image
 
     with profiler.section("build_grid"):
         grid_y, grid_x = np.mgrid[0:h, 0:w]
-        grid = np.stack((grid_y, grid_x), axis=-1).reshape(-1, 2)
+        grid = np.stack((grid_y, grid_x), axis=-1).reshape(-1, 2).astype(np.float32)
 
-    with profiler.section("rbf_eval"):
+    with profiler.section("interp_eval"):
         flow = interpolator(grid).reshape((h, w, 2)).astype(np.float32)
 
     with profiler.section("sample_coords"):
-        sample_y = grid_y + flow[:, :, 0]
-        sample_x = grid_x + flow[:, :, 1]
-        sample_x_norm = 2.0 * sample_x / (w - 1) - 1.0
-        sample_y_norm = 2.0 * sample_y / (h - 1) - 1.0
-        grid_np = np.stack((sample_x_norm, sample_y_norm), axis=-1).astype(np.float32)
+        sample_y = (grid_y + flow[:, :, 0]).astype(np.float32)
+        sample_x = (grid_x + flow[:, :, 1]).astype(np.float32)
 
-    with profiler.section("to_gpu"):
-        grid_tensor = torch.from_numpy(grid_np).unsqueeze(0).to(DEVICE)
-
-    with profiler.section("grid_sample"):
-        with torch.no_grad():
-            warped = gpu_utils.grid_sample_safe(image_tensor, grid_tensor)
+    with profiler.section("remap"):
+        warped = cv2.remap(
+            image,
+            sample_x,
+            sample_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
 
     return warped
