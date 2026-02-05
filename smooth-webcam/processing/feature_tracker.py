@@ -52,7 +52,6 @@ class FeatureTracker:
                 - matched_tracked: corresponding smoothed positions from cache
         """
         current_time = time.time()
-        alpha = self.calculate_alpha(dt, rc_milliseconds)
 
         if self.positions is None or len(self.positions) == 0:
             # First frame - initialize cache
@@ -92,6 +91,8 @@ class FeatureTracker:
             # Smooth position toward new detection
             new_pos = keypoints[detection_idx]
             old_pos = self.positions[cache_idx]
+            dt = current_time - self.last_seen[cache_idx]
+            alpha = self.calculate_alpha(dt, rc_milliseconds)
             smoothed = (new_pos * alpha) + (old_pos * (1.0 - alpha))
 
             self.positions[cache_idx] = smoothed
