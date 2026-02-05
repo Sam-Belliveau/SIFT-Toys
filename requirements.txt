@@ -1,4 +1,8 @@
 numpy
 opencv-python
+scipy
 scikit-image
+torch
+kornia
+kornia-moons
 scipy

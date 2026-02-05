@@ -1,46 +1,69 @@
 """
-SIFT Feature Detector (Stateful)
+SIFT Feature Detector (GPU)
 Uses: nothing
 Used by: main.py
 
-Keeps detector instance across frames to avoid recreation overhead.
+Kornia SIFT with MPS compatibility via grid_sample patch.
 """
 
-import cv2
-import numpy as np
+import torch
+import torch.nn.functional as F
+import kornia.feature as KF
 
 # === PARAMETERS ===
 DEFAULT_MAX_FEATURES = 64
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+# Patch grid_sample to use 'zeros' instead of 'border' for MPS compatibility
+_original_grid_sample = F.grid_sample
+
+
+def _patched_grid_sample(
+    input, grid, mode="bilinear", padding_mode="zeros", align_corners=None
+):
+    if padding_mode == "border":
+        padding_mode = "zeros"  # MPS doesn't support border, zeros works fine
+    return _original_grid_sample(
+        input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners
+    )
+
+
+F.grid_sample = _patched_grid_sample
 
 
 class SIFTDetector:
-    """Reusable SIFT detector that persists across frames."""
+    """GPU-accelerated SIFT detector."""
 
     def __init__(self):
-        self.detector = None
-        self.max_features = None
+        self.detector = KF.SIFTFeature(num_features=DEFAULT_MAX_FEATURES).to(DEVICE)
+        self.max_features = DEFAULT_MAX_FEATURES
 
-    def detect(self, gray_image, max_features=DEFAULT_MAX_FEATURES):
+    def detect(self, gray_tensor, max_features=DEFAULT_MAX_FEATURES):
         """
-        Extract SIFT keypoints and descriptors from grayscale image.
-        Returns (keypoints, descriptors):
-            - keypoints: Nx2 array of (y, x) coordinates
-            - descriptors: NxD array of feature descriptors
+        Extract SIFT keypoints and descriptors.
+
+        Args:
+            gray_tensor: [B, 1, H, W] float tensor on GPU
+
+        Returns:
+            (keypoints, descriptors): tensors on GPU
+                - keypoints: [N, 2] as (y, x)
+                - descriptors: [N, D]
         """
-        # Recreate detector only if max_features changed
-        if self.detector is None or self.max_features != max_features:
-            self.detector = cv2.SIFT_create(nfeatures=max_features)
+        if max_features != self.max_features:
+            self.detector = KF.SIFTFeature(num_features=max_features).to(DEVICE)
             self.max_features = max_features
 
-        keypoints_raw, descriptors = self.detector.detectAndCompute(gray_image, None)
+        with torch.no_grad():
+            lafs, responses, descriptors = self.detector(gray_tensor)
 
-        if not keypoints_raw:
-            return np.zeros((0, 2)), None
+        if lafs.shape[1] == 0:
+            return torch.zeros((0, 2), device=DEVICE), None
 
-        # OpenCV returns (x, y), we flip to (y, x)
-        keypoints = np.array(
-            [[kp.pt[1], kp.pt[0]] for kp in keypoints_raw],
-            dtype=np.float32,
-        )
+        # LAFs: [B, N, 2, 3] - center is last column as (x, y)
+        keypoints_xy = lafs[0, :, :, 2]  # [N, 2]
 
-        return keypoints, descriptors
+        # Flip (x, y) -> (y, x)
+        keypoints = torch.flip(keypoints_xy, dims=[1])
+
+        return keypoints, descriptors[0]

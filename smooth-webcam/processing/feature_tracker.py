@@ -1,167 +1,162 @@
 """
-Feature Tracker with LRU Cache (Stateful)
+Feature Tracker with LRU Cache (GPU)
 Uses: nothing
 Used by: main.py
 
 Maintains a cache of tracked features across frames.
-Features are matched by descriptor, positions are smoothed over time,
-and stale features are evicted using LRU policy.
+All operations use torch tensors on GPU.
 """
 
-import cv2
-import numpy as np
+import torch
+import kornia.feature as KF
 import time
 
 # === PARAMETERS ===
-MAX_CACHE_SIZE = 200  # Maximum features to track
-STALE_THRESHOLD_SEC = 2.0  # Evict features not seen for this long
-MATCH_RATIO = 0.75  # Lowe's ratio test threshold
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+MAX_CACHE_SIZE = 200
+STALE_THRESHOLD_SEC = 2.0
+MATCH_RATIO = 0.75
 
 
 class FeatureTracker:
-    """
-    Maintains a cache of tracked features with temporal smoothing.
-
-    Each cached feature stores:
-        - position: smoothed (y, x) position
-        - descriptor: SIFT descriptor for matching
-        - last_seen: timestamp of last update
-    """
+    """GPU-accelerated feature tracker."""
 
     def __init__(self):
-        self.positions = None  # Nx2 array of smoothed positions
-        self.descriptors = None  # NxD array of descriptors
-        self.last_seen = None  # N array of timestamps
+        self.positions = None  # [N, 2] tensor
+        self.descriptors = None  # [N, D] tensor
+        self.last_seen = None  # [N] tensor of timestamps
 
-        # Brute force matcher
-        self.matcher = cv2.BFMatcher(cv2.NORM_L2)
+        # Kornia matcher
+        self.matcher = KF.DescriptorMatcher("snn", th=MATCH_RATIO)
 
     def update(self, keypoints, descriptors, dt, rc_milliseconds):
         """
         Update tracker with new detections.
 
         Args:
-            keypoints: Nx2 array of detected (y, x) positions
-            descriptors: NxD array of SIFT descriptors
-            dt: Time since last frame (seconds)
-            rc_milliseconds: Smoothing time constant
+            keypoints: [N, 2] tensor of (y, x) positions
+            descriptors: [N, D] tensor of descriptors
+            dt: time since last frame (seconds)
+            rc_milliseconds: smoothing time constant
 
         Returns:
-            Tuple of (matched_detected, matched_tracked):
-                - matched_detected: positions from current frame that matched
-                - matched_tracked: corresponding smoothed positions from cache
+            (matched_detected, matched_tracked): both [M, 2] tensors
         """
         current_time = time.time()
 
-        if self.positions is None or len(self.positions) == 0:
-            # First frame - initialize cache
-            self.positions = keypoints.copy()
-            self.descriptors = descriptors.copy()
-            self.last_seen = np.full(len(keypoints), current_time)
-            return keypoints, keypoints.copy()
+        if self.positions is None or self.positions.shape[0] == 0:
+            self.positions = keypoints.clone()
+            self.descriptors = descriptors.clone()
+            self.last_seen = torch.full(
+                (keypoints.shape[0],), current_time, device=DEVICE
+            )
+            return keypoints, keypoints.clone()
 
-        if descriptors is None or len(keypoints) == 0:
-            return np.zeros((0, 2)), np.zeros((0, 2))
+        if descriptors is None or keypoints.shape[0] == 0:
+            return torch.zeros((0, 2), device=DEVICE), torch.zeros(
+                (0, 2), device=DEVICE
+            )
 
-        # Match new detections to cached features
-        matches = self.matcher.knnMatch(descriptors, self.descriptors, k=2)
+        # Match: descriptors [N, D], self.descriptors [M, D]
+        with torch.no_grad():
+            dists, match_idxs = self.matcher(descriptors, self.descriptors)
 
-        # Apply Lowe's ratio test
-        good_matches = []
-        for match_pair in matches:
-            if len(match_pair) == 2:
-                m, n = match_pair
-                if m.distance < MATCH_RATIO * n.distance:
-                    good_matches.append(m)
+        # match_idxs: [N, 2] where each row is (query_idx, train_idx)
+        # Filter valid matches (train_idx != -1)
+        valid_mask = match_idxs[:, 1] >= 0
+        valid_matches = match_idxs[valid_mask]
 
-        # Track which cache entries were matched
-        matched_cache_indices = set()
+        if valid_matches.shape[0] == 0:
+            # No matches - add all as new
+            self.positions = torch.cat([self.positions, keypoints], dim=0)
+            self.descriptors = torch.cat([self.descriptors, descriptors], dim=0)
+            self.last_seen = torch.cat(
+                [
+                    self.last_seen,
+                    torch.full((keypoints.shape[0],), current_time, device=DEVICE),
+                ]
+            )
+            self.evict_stale(current_time)
+            return torch.zeros((0, 2), device=DEVICE), torch.zeros(
+                (0, 2), device=DEVICE
+            )
+
         matched_detected = []
         matched_tracked = []
+        matched_cache_set = set()
 
-        for m in good_matches:
-            detection_idx = m.queryIdx
-            cache_idx = m.trainIdx
+        for query_idx, cache_idx in valid_matches.tolist():
+            cache_idx = int(cache_idx)
+            if cache_idx in matched_cache_set:
+                continue
+            matched_cache_set.add(cache_idx)
 
-            if cache_idx in matched_cache_indices:
-                continue  # Already matched this cache entry
+            # Calculate alpha based on this feature's last seen time
+            feature_dt = current_time - self.last_seen[cache_idx].item()
+            alpha = self.calculate_alpha(feature_dt, rc_milliseconds)
 
-            matched_cache_indices.add(cache_idx)
-
-            # Smooth position toward new detection
-            new_pos = keypoints[detection_idx]
+            new_pos = keypoints[query_idx]
             old_pos = self.positions[cache_idx]
-            dt = current_time - self.last_seen[cache_idx]
-            alpha = self.calculate_alpha(dt, rc_milliseconds)
-            smoothed = (new_pos * alpha) + (old_pos * (1.0 - alpha))
+            smoothed = new_pos * alpha + old_pos * (1.0 - alpha)
 
             self.positions[cache_idx] = smoothed
-            self.descriptors[cache_idx] = descriptors[detection_idx]
+            self.descriptors[cache_idx] = descriptors[query_idx]
             self.last_seen[cache_idx] = current_time
 
             matched_detected.append(new_pos)
             matched_tracked.append(smoothed)
 
-        # Add unmatched detections as new cache entries
-        for i in range(len(keypoints)):
-            if not any(
-                m.queryIdx == i
-                for m in good_matches
-                if m.trainIdx in matched_cache_indices or True
-            ):
-                # Check if this detection was matched
-                was_matched = any(m.queryIdx == i for m in good_matches)
-                if not was_matched:
-                    self.positions = np.vstack([self.positions, keypoints[i : i + 1]])
-                    self.descriptors = np.vstack(
-                        [self.descriptors, descriptors[i : i + 1]]
-                    )
-                    self.last_seen = np.append(self.last_seen, current_time)
+        # Add unmatched detections
+        matched_query_set = set(valid_matches[:, 0].tolist())
+        for i in range(keypoints.shape[0]):
+            if i not in matched_query_set:
+                self.positions = torch.cat(
+                    [self.positions, keypoints[i : i + 1]], dim=0
+                )
+                self.descriptors = torch.cat(
+                    [self.descriptors, descriptors[i : i + 1]], dim=0
+                )
+                self.last_seen = torch.cat(
+                    [self.last_seen, torch.tensor([current_time], device=DEVICE)]
+                )
 
-        # Evict stale entries (LRU)
         self.evict_stale(current_time)
 
         if len(matched_detected) == 0:
-            return np.zeros((0, 2)), np.zeros((0, 2))
+            return torch.zeros((0, 2), device=DEVICE), torch.zeros(
+                (0, 2), device=DEVICE
+            )
 
-        return np.array(matched_detected), np.array(matched_tracked)
+        return torch.stack(matched_detected), torch.stack(matched_tracked)
 
     def evict_stale(self, current_time):
         """Remove features not seen recently."""
         if self.last_seen is None:
             return
 
-        # Keep features seen within threshold, or if cache under limit
-        age = current_time - self.last_seen
-        keep_mask = age < STALE_THRESHOLD_SEC
+        age = current_time - self.last_seen.cpu().numpy()
+        keep_mask = torch.from_numpy(age < STALE_THRESHOLD_SEC).to(DEVICE)
 
-        # Also enforce max cache size by keeping most recent
-        if np.sum(keep_mask) > MAX_CACHE_SIZE:
-            # Keep only the MAX_CACHE_SIZE most recently seen
-            sorted_indices = np.argsort(-self.last_seen)  # Most recent first
-            keep_indices = sorted_indices[:MAX_CACHE_SIZE]
-            keep_mask = np.zeros(len(self.last_seen), dtype=bool)
-            keep_mask[keep_indices] = True
+        if keep_mask.sum() > MAX_CACHE_SIZE:
+            sorted_indices = torch.argsort(-self.last_seen)[:MAX_CACHE_SIZE]
+            keep_mask = torch.zeros(
+                self.last_seen.shape[0], dtype=torch.bool, device=DEVICE
+            )
+            keep_mask[sorted_indices] = True
 
-        if np.sum(keep_mask) < len(self.positions):
+        if keep_mask.sum() < self.positions.shape[0]:
             self.positions = self.positions[keep_mask]
             self.descriptors = self.descriptors[keep_mask]
             self.last_seen = self.last_seen[keep_mask]
 
     def reset(self):
-        """Clear all cached features."""
         self.positions = None
         self.descriptors = None
         self.last_seen = None
 
-    def get_cache_size(self):
-        """Return current number of cached features."""
-        return 0 if self.positions is None else len(self.positions)
-
     @staticmethod
     def calculate_alpha(dt, rc_milliseconds):
-        """Calculate smoothing alpha from time constant."""
         if rc_milliseconds <= 0:
             return 1.0
         rc_seconds = rc_milliseconds / 1000.0
-        return 1.0 - np.exp(-dt / rc_seconds)
+        return 1.0 - torch.exp(torch.tensor(-dt / rc_seconds)).item()

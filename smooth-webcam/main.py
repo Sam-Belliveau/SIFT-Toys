@@ -1,29 +1,57 @@
 """
-Smooth Webcam - Image Warp with SIFT Feature Tracking
+Smooth Webcam - GPU Accelerated SIFT Feature Tracking
 
-Main orchestrator that combines all modules.
+Main orchestrator.
 
-Uses:
-  - frontend/video_capture
-  - frontend/interface
-  - frontend/debug_overlay
-  - frontend/display
-  - sift/detector
-  - processing/grayscale
-  - processing/feature_tracker
-  - processing/image_warp
+CPU transfers (justified):
+  1. Camera capture -> tensor: Unavoidable, camera outputs numpy
+  2. Tensor -> display: Unavoidable, cv2.imshow needs numpy
+  3. RBF interpolation: scipy has no GPU support, but only points transfer (small)
+
+Everything else stays on GPU.
 """
 
 import time
+import torch
+import cv2
 
-from frontend import video_capture, interface, debug_overlay, display
+from frontend import video_capture, interface, display
 from sift.detector import SIFTDetector
-from processing import grayscale, image_warp
+from processing import grayscale, image_warp, gpu_utils
 from processing.feature_tracker import FeatureTracker
+
+# === PARAMETERS ===
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+MIN_FEATURES = 4
+
+# Colors for GPU drawing (RGB, 0-1)
+COLOR_RED = torch.tensor([1.0, 0.0, 0.0], device=DEVICE)
+COLOR_GREEN = torch.tensor([0.0, 1.0, 0.0], device=DEVICE)
+COLOR_WHITE = torch.tensor([1.0, 1.0, 1.0], device=DEVICE)
+
+
+def frame_to_tensor(frame):
+    """
+    Capture frame to GPU tensor.
+    CPU->GPU transfer: Unavoidable, camera outputs numpy.
+    """
+    rgb = frame[:, :, ::-1].copy()
+    tensor = torch.from_numpy(rgb).float().to(DEVICE) / 255.0
+    return tensor.permute(2, 0, 1).unsqueeze(0)
+
+
+def tensor_to_frame(tensor):
+    """
+    GPU tensor to display frame.
+    GPU->CPU transfer: Unavoidable, cv2.imshow needs numpy.
+    """
+    rgb = (tensor[0].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
+    return rgb[:, :, ::-1].copy()
 
 
 def main():
-    # Initialize stateful components
+    print(f"Using device: {DEVICE}")
+
     camera = video_capture.get_stream()
     sift = SIFTDetector()
     tracker = FeatureTracker()
@@ -34,46 +62,53 @@ def main():
 
     try:
         while True:
-            # Timing
             current_time = time.time()
             dt = current_time - last_time
             last_time = current_time
 
-            # Capture
+            # CPU->GPU: camera capture (unavoidable)
             frame = video_capture.get_frame(camera)
             if frame is None:
                 break
 
-            # Read UI params
             max_features, rc_ms = interface.read_params()
 
-            # Extract features
-            gray = grayscale.convert(frame)
-            keypoints, descriptors = sift.detect(gray, max_features)
+            img_tensor = frame_to_tensor(frame)
+            gray_tensor = grayscale.convert(img_tensor)
 
-            if len(keypoints) < 4:
-                display.show(frame)
+            # Feature detection (GPU)
+            keypoints, descriptors = sift.detect(gray_tensor, max_features)
+
+            if keypoints.shape[0] < MIN_FEATURES:
+                output = tensor_to_frame(img_tensor)
+                display.show(output)
                 continue
 
-            # Track features (matches internally, smooths positions)
+            # Feature tracking (GPU)
             detected, tracked = tracker.update(keypoints, descriptors, dt, rc_ms)
 
-            if len(detected) < 4:
-                display.show(frame)
+            if detected.shape[0] < MIN_FEATURES:
+                output = tensor_to_frame(img_tensor)
+                display.show(output)
                 continue
 
-            # Warp image
-            map_x, map_y = image_warp.generate_warp_map(
-                frame.shape,
-                source_points=detected,
-                destination_points=tracked,
+            # Image warp (GPU, with CPU hop for RBF only)
+            warped_tensor = image_warp.warp_image(img_tensor, detected, tracked)
+
+            # Draw overlay (GPU)
+            output_tensor = gpu_utils.draw_lines(
+                warped_tensor, detected, tracked, COLOR_WHITE
             )
-            warped = image_warp.apply_warp(frame, map_x, map_y)
+            output_tensor = gpu_utils.draw_points(
+                output_tensor, detected, COLOR_RED, radius=3
+            )
+            output_tensor = gpu_utils.draw_points(
+                output_tensor, tracked, COLOR_GREEN, radius=3
+            )
 
-            # Draw debug overlay
-            output = debug_overlay.draw(warped, detected, tracked)
+            # GPU->CPU: display (unavoidable)
+            output = tensor_to_frame(output_tensor)
 
-            # Display
             if not display.show(output):
                 break
 

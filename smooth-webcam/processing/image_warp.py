@@ -1,93 +1,78 @@
 """
-Image Warp
-Uses: nothing
+Image Warp (GPU)
+Uses: processing/gpu_utils
 Used by: main.py
 
-Warps images based on point correspondences.
-Interpolates displacement field rather than absolute positions.
+GPU image warping. RBF interpolation must be on CPU (scipy limitation),
+but the actual grid_sample warp is on GPU.
 """
 
+import torch
 import numpy as np
-import cv2
 from scipy import interpolate
+from processing import gpu_utils
 
 # === PARAMETERS ===
-SMOOTHING = 10.0  # RBF smoothing - higher prevents wild extrapolation
-DEBUG = True  # Print debug info
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+SMOOTHING = 10.0
 
 
-def create_displacement_interpolator(source_points, displacements):
+def warp_image(image_tensor, source_points, destination_points):
     """
-    Create interpolator for displacement field.
-    Maps source positions -> displacement vectors.
+    Warp image using displacement field.
+
+    CPU transfer justification:
+        - scipy.interpolate.RBFInterpolator has no GPU implementation
+        - Points are small (N~64), transfer is negligible
+        - Flow field (H*W*2) is computed on CPU then sent to GPU once
+
+    Args:
+        image_tensor: [B, C, H, W] float tensor on GPU
+        source_points: [N, 2] tensor (y, x) on GPU
+        destination_points: [N, 2] tensor (y, x) on GPU
+
+    Returns:
+        [B, C, H, W] warped tensor on GPU
     """
+    _, _, h, w = image_tensor.shape
+
+    # Transfer points to CPU for RBF (small, ~64 points)
+    src_np = source_points.detach().cpu().numpy()
+    dst_np = destination_points.detach().cpu().numpy()
+
+    # Skip if NaN
+    if np.any(np.isnan(src_np)) or np.any(np.isnan(dst_np)):
+        return image_tensor
+
+    displacements = dst_np - src_np
+
+    # RBF interpolation (CPU - no GPU scipy)
     try:
-        return interpolate.RBFInterpolator(
-            source_points,
-            displacements,
-            smoothing=SMOOTHING,
+        interpolator = interpolate.RBFInterpolator(
+            src_np, displacements, smoothing=SMOOTHING
         )
-    except (ValueError, np.linalg.LinAlgError) as e:
-        if DEBUG:
-            print(f"RBF failed: {e}")
-        return None
+    except (ValueError, np.linalg.LinAlgError):
+        return image_tensor
 
-
-def generate_warp_map(image_shape, source_points, destination_points):
-    """
-    Generate warp maps for cv2.remap.
-    Interpolates displacement field from point correspondences.
-    """
-    h, w = image_shape[:2]
-
-    # Calculate displacements at control points (in y,x order)
-    displacements = destination_points - source_points
-
-    if DEBUG:
-        avg_disp = np.mean(np.abs(displacements))
-        max_disp = np.max(np.abs(displacements))
-        print(
-            f"Points: {len(source_points)}, Avg displacement: {avg_disp:.2f}, Max: {max_disp:.2f}"
-        )
-
-    # Create displacement interpolator
-    interpolator = create_displacement_interpolator(source_points, displacements)
-
-    if interpolator is None:
-        # Return identity map on failure
-        map_x = np.arange(w, dtype=np.float32)[np.newaxis, :].repeat(h, axis=0)
-        map_y = np.arange(h, dtype=np.float32)[:, np.newaxis].repeat(w, axis=1)
-        return map_x, map_y
-
-    # Build coordinate grid (y, x)
+    # Build dense flow field (CPU)
     grid_y, grid_x = np.mgrid[0:h, 0:w]
-    grid = np.stack((grid_y, grid_x), axis=-1)
-    flat_grid = grid.reshape(-1, 2)
+    grid = np.stack((grid_y, grid_x), axis=-1).reshape(-1, 2)
+    flow = interpolator(grid).reshape((h, w, 2)).astype(np.float32)
 
-    # Interpolate displacement at every pixel
-    displacement_field = interpolator(flat_grid).reshape((h, w, 2))
+    # Build sampling coordinates
+    sample_y = grid_y + flow[:, :, 0]
+    sample_x = grid_x + flow[:, :, 1]
 
-    if DEBUG:
-        field_max = np.max(np.abs(displacement_field))
-        print(f"Field max displacement: {field_max:.2f}")
+    # Normalize to [-1, 1] for grid_sample
+    sample_x_norm = 2.0 * sample_x / (w - 1) - 1.0
+    sample_y_norm = 2.0 * sample_y / (h - 1) - 1.0
 
-    # For cv2.remap: map tells where to sample FROM
-    # If we want content to move with the tracked points, we add displacement
-    new_y = grid_y + displacement_field[:, :, 0]
-    new_x = grid_x + displacement_field[:, :, 1]
+    # Transfer grid to GPU (one transfer of H*W*2 floats)
+    grid_np = np.stack((sample_x_norm, sample_y_norm), axis=-1).astype(np.float32)
+    grid_tensor = torch.from_numpy(grid_np).unsqueeze(0).to(DEVICE)
 
-    # Clamp to image bounds
-    map_y = np.clip(new_y, 0, h - 1).astype(np.float32)
-    map_x = np.clip(new_x, 0, w - 1).astype(np.float32)
+    # GPU warp
+    with torch.no_grad():
+        warped = gpu_utils.grid_sample_safe(image_tensor, grid_tensor)
 
-    return map_x, map_y
-
-
-def apply_warp(image, map_x, map_y):
-    """Apply warp maps to image."""
-    return cv2.remap(
-        image,
-        map_x,
-        map_y,
-        cv2.INTER_LINEAR,
-    )
+    return warped
