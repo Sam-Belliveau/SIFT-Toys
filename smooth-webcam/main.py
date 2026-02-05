@@ -1,5 +1,5 @@
 """
-Smooth Webcam - RBF Warp with SIFT Feature Tracking
+Smooth Webcam - Image Warp with SIFT Feature Tracking
 
 Main orchestrator that combines all modules.
 
@@ -10,16 +10,15 @@ Uses:
   - frontend/display
   - sift/detector
   - processing/grayscale
-  - processing/optimal_transport
-  - processing/lowpass_filter
-  - processing/rbf_warp
+  - processing/feature_tracker
+  - processing/image_warp
 """
 
 import time
 
 from frontend import video_capture, interface, debug_overlay, display
 from sift.detector import SIFTDetector
-from processing import grayscale, point_matching, image_warp
+from processing import grayscale, image_warp
 from processing.feature_tracker import FeatureTracker
 
 
@@ -50,31 +49,29 @@ def main():
 
             # Extract features
             gray = grayscale.convert(frame)
-            keypoints = sift.detect(gray, max_features)
+            keypoints, descriptors = sift.detect(gray, max_features)
 
             if len(keypoints) < 4:
                 display.show(frame)
                 continue
 
-            # Match to previous frame
-            matched = point_matching.match_points(
-                keypoints,
-                tracker.tracked,
-            )
+            # Track features (matches internally, smooths positions)
+            detected, tracked = tracker.update(keypoints, descriptors, dt, rc_ms)
 
-            # Track keypoints
-            tracked = tracker.update(matched, dt, rc_ms)
+            if len(detected) < 4:
+                display.show(frame)
+                continue
 
             # Warp image
             map_x, map_y = image_warp.generate_warp_map(
                 frame.shape,
-                source_points=keypoints,
+                source_points=detected,
                 destination_points=tracked,
             )
             warped = image_warp.apply_warp(frame, map_x, map_y)
 
             # Draw debug overlay
-            output = debug_overlay.draw(warped, keypoints, tracked)
+            output = debug_overlay.draw(warped, detected, tracked)
 
             # Display
             if not display.show(output):

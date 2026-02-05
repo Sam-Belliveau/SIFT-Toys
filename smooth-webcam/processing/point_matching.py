@@ -3,38 +3,67 @@ Point Matching Across Frames
 Uses: nothing
 Used by: main.py
 
-Matches current keypoints to previous keypoints for tracking.
+Matches current keypoints to previous keypoints using SIFT descriptors.
 """
 
+import cv2
 import numpy as np
-from scipy import optimize
+
+# === PARAMETERS ===
+MATCH_RATIO = 0.75  # Lowe's ratio test threshold
 
 
-def distance_matrix(points_a, points_b):
-    """Compute pairwise Euclidean distances between two point sets."""
-    diff = points_a[:, np.newaxis, :] - points_b[np.newaxis, :, :]
-    return np.sqrt((diff**2).sum(axis=2))
-
-
-def match_points(current_points, previous_points):
+def match_points(
+    current_keypoints,
+    current_descriptors,
+    previous_keypoints,
+    previous_descriptors,
+):
     """
-    Match current keypoints to previous keypoints.
+    Match current features to previous features using descriptor matching.
 
-    Returns matched previous points in same order as current,
-    or current points if no previous history.
+    Returns:
+        - matched_current: keypoints from current frame that have matches
+        - matched_previous: corresponding keypoints from previous frame
+
+    If no previous data, returns (current_keypoints, current_keypoints).
     """
-    if previous_points is None:
-        return current_points
+    if previous_keypoints is None or previous_descriptors is None:
+        return current_keypoints, current_keypoints.copy()
 
-    if len(current_points) == 0:
-        return previous_points
+    if len(current_keypoints) == 0 or len(previous_keypoints) == 0:
+        return current_keypoints, current_keypoints.copy()
 
-    cost_matrix = distance_matrix(current_points, previous_points)
+    if current_descriptors is None or previous_descriptors is None:
+        return current_keypoints, current_keypoints.copy()
 
-    row_indices, col_indices = optimize.linear_sum_assignment(cost_matrix)
+    # Use FLANN matcher for speed
+    index_params = dict(algorithm=1, trees=5)  # FLANN_INDEX_KDTREE
+    search_params = dict(checks=50)
+    matcher = cv2.FlannBasedMatcher(index_params, search_params)
 
-    matched = np.zeros_like(current_points)
-    matched[:] = current_points[:]
-    matched[row_indices] = previous_points[col_indices]
+    # Match current -> previous
+    matches = matcher.knnMatch(current_descriptors, previous_descriptors, k=2)
 
-    return matched
+    # Apply Lowe's ratio test
+    good_matches = []
+    for match_pair in matches:
+        if len(match_pair) == 2:
+            m, n = match_pair
+            if m.distance < MATCH_RATIO * n.distance:
+                good_matches.append(m)
+
+    if len(good_matches) < 4:
+        return current_keypoints, current_keypoints.copy()
+
+    # Extract matched points
+    matched_current = np.array(
+        [current_keypoints[m.queryIdx] for m in good_matches],
+        dtype=np.float32,
+    )
+    matched_previous = np.array(
+        [previous_keypoints[m.trainIdx] for m in good_matches],
+        dtype=np.float32,
+    )
+
+    return matched_current, matched_previous
