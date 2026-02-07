@@ -1,118 +1,206 @@
 """
 Feature Tracker (CPU)
 
-Simple ORB feature tracking using cv2.BFMatcher with Hamming distance.
+Lucas-Kanade optical flow tracking with exponential smoothing.
 """
 
-import time
 import numpy as np
 import cv2
 from profiler import profiler
 
 # === PARAMETERS ===
-MAX_DISTANCE_PX = 50.0  # Reject matches that jump more than this
-STALE_SEC = 0.2
-MIN_STABLE_FRAMES = 3
+MAX_CORNERS = 500
+CORNER_QUALITY = 0.01
+CORNER_MIN_DIST = 15
+BLOCK_SIZE = 7
+
+LK_WIN_SIZE = (21, 21)
+LK_MAX_LEVEL = 3
+LK_CRITERIA = (
+    cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+    30,
+    0.01,
+)
+
+BACKTRACK_THRESHOLD = 1.0
+REDETECT_INTERVAL = 10
+MIN_TRACK_COUNT = 20
 
 
 class FeatureTracker:
     def __init__(self):
-        self.cache_pos = None
-        self.cache_desc = None
-        self.cache_time = None
-        self.cache_stable = None
-        # Hamming distance for binary ORB descriptors
-        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        self.prev_gray = None
+        self.raw_points = None
+        self.smooth_points = None
+        self.frame_count = 0
 
-    def update(self, keypoints, descriptors, dt, rc_ms):
-        """Match new detections to cache, apply smoothing."""
-        with profiler.section("update"):
-            now = time.time()
-            alpha = 1.0 - np.exp(-dt / (rc_ms / 1000.0)) if rc_ms > 0 else 1.0
+    def update(
+        self,
+        gray,
+        dt,
+        rc_ms,
+        max_features=MAX_CORNERS,
+    ):
+        alpha = 1.0 - np.exp(-dt / (rc_ms / 1000.0)) if rc_ms > 0 else 1.0
 
-            # First frame: init cache
-            if self.cache_pos is None or len(self.cache_pos) == 0:
-                self._init_cache(keypoints, descriptors, now)
-                return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
+        if self.prev_gray is None:
+            with profiler.section("detect"):
+                self._detect(gray, max_features)
+            self.prev_gray = gray
+            return (
+                np.zeros((0, 2), np.float32),
+                np.zeros((0, 2), np.float32),
+            )
 
-            if descriptors is None or len(keypoints) == 0:
-                return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
+        self.frame_count += 1
 
-            # Match with crossCheck (simpler, no ratio test needed)
-            with profiler.section("match"):
-                try:
-                    matches = self.matcher.match(descriptors, self.cache_desc)
-                except cv2.error:
-                    return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
+        with profiler.section("optical_flow"):
+            raw, smooth = self._track(gray, alpha)
 
-            # Filter by distance, update cache
-            with profiler.section("filter"):
-                detected, tracked = [], []
-                used_cache = set()
+        needs_redetect = (
+            self.frame_count % REDETECT_INTERVAL == 0
+            or len(self.raw_points) < MIN_TRACK_COUNT
+        )
 
-                for m in matches:
-                    det_idx, cache_idx = m.queryIdx, m.trainIdx
-                    if cache_idx in used_cache:
-                        continue
+        if needs_redetect:
+            with profiler.section("redetect"):
+                self._add_new_points(gray, max_features)
 
-                    new_pos = keypoints[det_idx]
-                    old_pos = self.cache_pos[cache_idx]
-                    if np.linalg.norm(new_pos - old_pos) > MAX_DISTANCE_PX:
-                        continue
+        self.prev_gray = gray
+        return raw, smooth
 
-                    used_cache.add(cache_idx)
+    def _detect(
+        self,
+        gray,
+        max_features,
+    ):
+        corners = cv2.goodFeaturesToTrack(
+            gray,
+            maxCorners=max_features,
+            qualityLevel=CORNER_QUALITY,
+            minDistance=CORNER_MIN_DIST,
+            blockSize=BLOCK_SIZE,
+        )
 
-                    smoothed = alpha * new_pos + (1 - alpha) * old_pos
-                    self.cache_pos[cache_idx] = smoothed
-                    self.cache_desc[cache_idx] = descriptors[det_idx]
-                    self.cache_time[cache_idx] = now
-                    self.cache_stable[cache_idx] += 1
+        if corners is None:
+            self.raw_points = np.zeros((0, 2), np.float32)
+            self.smooth_points = np.zeros((0, 2), np.float32)
+            return
 
-                    if self.cache_stable[cache_idx] >= MIN_STABLE_FRAMES:
-                        detected.append(new_pos)
-                        tracked.append(smoothed)
+        pts = corners.reshape(-1, 2)
+        # Convert (x, y) → (y, x) for consistency
+        pts = pts[:, ::-1].copy().astype(np.float32)
+        self.raw_points = pts
+        self.smooth_points = pts.copy()
 
-                # Reset stability for unmatched
-                for i in range(len(self.cache_pos)):
-                    if i not in used_cache:
-                        self.cache_stable[i] = 0
+    def _track(
+        self,
+        gray,
+        alpha,
+    ):
+        if self.raw_points is None or len(self.raw_points) == 0:
+            return (
+                np.zeros((0, 2), np.float32),
+                np.zeros((0, 2), np.float32),
+            )
 
-            # Add new detections
-            with profiler.section("add_new"):
-                matched_dets = {m.queryIdx for m in matches if m.trainIdx in used_cache}
-                for i in range(len(keypoints)):
-                    if i not in matched_dets:
-                        self.cache_pos = np.vstack(
-                            [self.cache_pos, keypoints[i : i + 1]]
-                        )
-                        self.cache_desc = np.vstack(
-                            [self.cache_desc, descriptors[i : i + 1]]
-                        )
-                        self.cache_time = np.append(self.cache_time, now)
-                        self.cache_stable = np.append(self.cache_stable, 1)
+        # Points for LK need (x, y) shape (N, 1, 2)
+        prev_pts = self.raw_points[:, ::-1].reshape(-1, 1, 2).astype(np.float32)
 
-            # Evict stale
-            with profiler.section("evict"):
-                keep = (now - self.cache_time) < STALE_SEC
-                if np.sum(keep) < len(self.cache_pos):
-                    self.cache_pos = self.cache_pos[keep]
-                    self.cache_desc = self.cache_desc[keep]
-                    self.cache_time = self.cache_time[keep]
-                    self.cache_stable = self.cache_stable[keep]
+        with profiler.section("forward"):
+            next_pts, status_fwd, _ = cv2.calcOpticalFlowPyrLK(
+                self.prev_gray,
+                gray,
+                prev_pts,
+                None,
+                winSize=LK_WIN_SIZE,
+                maxLevel=LK_MAX_LEVEL,
+                criteria=LK_CRITERIA,
+            )
 
-            if len(detected) == 0:
-                return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
+        with profiler.section("backward"):
+            back_pts, status_bwd, _ = cv2.calcOpticalFlowPyrLK(
+                gray,
+                self.prev_gray,
+                next_pts,
+                None,
+                winSize=LK_WIN_SIZE,
+                maxLevel=LK_MAX_LEVEL,
+                criteria=LK_CRITERIA,
+            )
 
-            return np.array(detected, np.float32), np.array(tracked, np.float32)
+        with profiler.section("validate"):
+            fb_error = np.linalg.norm(
+                prev_pts.reshape(-1, 2) - back_pts.reshape(-1, 2),
+                axis=1,
+            )
+            valid = (
+                (status_fwd.ravel() == 1)
+                & (status_bwd.ravel() == 1)
+                & (fb_error < BACKTRACK_THRESHOLD)
+            )
 
-    def _init_cache(self, keypoints, descriptors, now):
-        self.cache_pos = keypoints.copy()
-        self.cache_desc = descriptors.copy() if descriptors is not None else None
-        self.cache_time = np.full(len(keypoints), now)
-        self.cache_stable = np.ones(len(keypoints), dtype=np.int32)
+        if not np.any(valid):
+            self.raw_points = np.zeros((0, 2), np.float32)
+            self.smooth_points = np.zeros((0, 2), np.float32)
+            return (
+                np.zeros((0, 2), np.float32),
+                np.zeros((0, 2), np.float32),
+            )
+
+        with profiler.section("smooth"):
+            # Convert tracked points back to (y, x)
+            new_raw = next_pts.reshape(-1, 2)[valid][:, ::-1].copy().astype(np.float32)
+            old_smooth = self.smooth_points[valid]
+
+            new_smooth = alpha * new_raw + (1.0 - alpha) * old_smooth
+
+            self.raw_points = new_raw
+            self.smooth_points = new_smooth
+
+        return self.raw_points.copy(), self.smooth_points.copy()
+
+    def _add_new_points(
+        self,
+        gray,
+        max_features,
+    ):
+        existing_count = len(self.raw_points) if self.raw_points is not None else 0
+        needed = max_features - existing_count
+
+        if needed <= 0:
+            return
+
+        mask = np.full(gray.shape[:2], 255, dtype=np.uint8)
+
+        if self.raw_points is not None and len(self.raw_points) > 0:
+            for pt in self.raw_points:
+                y, x = int(pt[0]), int(pt[1])
+                cv2.circle(mask, (x, y), int(CORNER_MIN_DIST), 0, -1)
+
+        corners = cv2.goodFeaturesToTrack(
+            gray,
+            maxCorners=needed,
+            qualityLevel=CORNER_QUALITY,
+            minDistance=CORNER_MIN_DIST,
+            blockSize=BLOCK_SIZE,
+            mask=mask,
+        )
+
+        if corners is None:
+            return
+
+        new_pts = corners.reshape(-1, 2)[:, ::-1].copy().astype(np.float32)
+
+        if self.raw_points is not None and len(self.raw_points) > 0:
+            self.raw_points = np.vstack([self.raw_points, new_pts])
+            self.smooth_points = np.vstack([self.smooth_points, new_pts])
+        else:
+            self.raw_points = new_pts
+            self.smooth_points = new_pts.copy()
 
     def reset(self):
-        self.cache_pos = None
-        self.cache_desc = None
-        self.cache_time = None
-        self.cache_stable = None
+        self.prev_gray = None
+        self.raw_points = None
+        self.smooth_points = None
+        self.frame_count = 0
