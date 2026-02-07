@@ -61,7 +61,7 @@ def warp_image(
                 all_points,
                 all_disps,
                 kernel="multiquadric",
-                epsilon=5.0,
+                epsilon=1.0,
             )
         except Exception as e:
             print(f"Interpolator failed: {e}")

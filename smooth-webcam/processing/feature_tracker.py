@@ -9,9 +9,9 @@ import cv2
 from profiler import profiler
 
 # === PARAMETERS ===
-MAX_CORNERS = 500
-CORNER_QUALITY = 0.01
-CORNER_MIN_DIST = 15
+MAX_CORNERS = 1000
+CORNER_QUALITY = 0.05
+CORNER_MIN_DIST = 5
 BLOCK_SIZE = 7
 
 LK_WIN_SIZE = (21, 21)
