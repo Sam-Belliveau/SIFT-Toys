@@ -1,9 +1,7 @@
 """
 Feature Tracker (CPU)
-Uses: profiler
-Used by: main.py
 
-Tracks features across frames using descriptor matching and temporal smoothing.
+Simple ORB feature tracking using cv2.BFMatcher with Hamming distance.
 """
 
 import time
@@ -12,149 +10,109 @@ import cv2
 from profiler import profiler
 
 # === PARAMETERS ===
-MATCH_RATIO = 0.75
-STALE_THRESHOLD_SEC = 2.0
-MAX_CACHE_SIZE = 256
+MAX_DISTANCE_PX = 50.0  # Reject matches that jump more than this
+STALE_SEC = 0.2
+MIN_STABLE_FRAMES = 3
 
 
 class FeatureTracker:
-    """
-    Maintains a cache of tracked features with temporal smoothing.
-    """
-
     def __init__(self):
-        self.positions = None
-        self.descriptors = None
-        self.last_seen = None
-        self.matcher = cv2.BFMatcher(cv2.NORM_L2)
+        self.cache_pos = None
+        self.cache_desc = None
+        self.cache_time = None
+        self.cache_stable = None
+        # Hamming distance for binary ORB descriptors
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-    def update(
-        self,
-        keypoints,
-        descriptors,
-        dt,
-        rc_milliseconds,
-    ):
-        """
-        Update tracker with new detections.
-
-        Args:
-            keypoints: Nx2 array of (y, x) positions
-            descriptors: NxD array of SIFT descriptors
-            dt: Time since last frame (seconds)
-            rc_milliseconds: Smoothing time constant
-
-        Returns:
-            Tuple of (detected, tracked):
-                - detected: positions from current frame that matched
-                - tracked: corresponding smoothed positions from cache
-        """
+    def update(self, keypoints, descriptors, dt, rc_ms):
+        """Match new detections to cache, apply smoothing."""
         with profiler.section("update"):
-            current_time = time.time()
-            alpha = self.calculate_alpha(dt, rc_milliseconds)
+            now = time.time()
+            alpha = 1.0 - np.exp(-dt / (rc_ms / 1000.0)) if rc_ms > 0 else 1.0
 
-            if self.positions is None or len(self.positions) == 0:
-                self.positions = keypoints.copy()
-                self.descriptors = (
-                    descriptors.copy() if descriptors is not None else None
-                )
-                self.last_seen = np.full(len(keypoints), current_time)
-                return keypoints, keypoints.copy()
+            # First frame: init cache
+            if self.cache_pos is None or len(self.cache_pos) == 0:
+                self._init_cache(keypoints, descriptors, now)
+                return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
 
             if descriptors is None or len(keypoints) == 0:
-                return np.zeros((0, 2), dtype=np.float32), np.zeros(
-                    (0, 2), dtype=np.float32
-                )
+                return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
 
+            # Match with crossCheck (simpler, no ratio test needed)
             with profiler.section("match"):
-                matches = self.matcher.knnMatch(descriptors, self.descriptors, k=2)
+                try:
+                    matches = self.matcher.match(descriptors, self.cache_desc)
+                except cv2.error:
+                    return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
 
-            with profiler.section("ratio_test"):
-                good_matches = []
-                for match_pair in matches:
-                    if len(match_pair) == 2:
-                        m, n = match_pair
-                        if m.distance < MATCH_RATIO * n.distance:
-                            good_matches.append(m)
+            # Filter by distance, update cache
+            with profiler.section("filter"):
+                detected, tracked = [], []
+                used_cache = set()
 
-            with profiler.section("smooth"):
-                matched_cache_indices = set()
-                matched_detected = []
-                matched_tracked = []
-
-                for m in good_matches:
-                    detection_idx = m.queryIdx
-                    cache_idx = m.trainIdx
-
-                    if cache_idx in matched_cache_indices:
+                for m in matches:
+                    det_idx, cache_idx = m.queryIdx, m.trainIdx
+                    if cache_idx in used_cache:
                         continue
 
-                    matched_cache_indices.add(cache_idx)
+                    new_pos = keypoints[det_idx]
+                    old_pos = self.cache_pos[cache_idx]
+                    if np.linalg.norm(new_pos - old_pos) > MAX_DISTANCE_PX:
+                        continue
 
-                    new_pos = keypoints[detection_idx]
-                    old_pos = self.positions[cache_idx]
-                    smoothed = (new_pos * alpha) + (old_pos * (1.0 - alpha))
+                    used_cache.add(cache_idx)
 
-                    self.positions[cache_idx] = smoothed
-                    self.descriptors[cache_idx] = descriptors[detection_idx]
-                    self.last_seen[cache_idx] = current_time
+                    smoothed = alpha * new_pos + (1 - alpha) * old_pos
+                    self.cache_pos[cache_idx] = smoothed
+                    self.cache_desc[cache_idx] = descriptors[det_idx]
+                    self.cache_time[cache_idx] = now
+                    self.cache_stable[cache_idx] += 1
 
-                    matched_detected.append(new_pos)
-                    matched_tracked.append(smoothed)
+                    if self.cache_stable[cache_idx] >= MIN_STABLE_FRAMES:
+                        detected.append(new_pos)
+                        tracked.append(smoothed)
 
+                # Reset stability for unmatched
+                for i in range(len(self.cache_pos)):
+                    if i not in used_cache:
+                        self.cache_stable[i] = 0
+
+            # Add new detections
             with profiler.section("add_new"):
+                matched_dets = {m.queryIdx for m in matches if m.trainIdx in used_cache}
                 for i in range(len(keypoints)):
-                    was_matched = any(m.queryIdx == i for m in good_matches)
-                    if not was_matched:
-                        self.positions = np.vstack(
-                            [self.positions, keypoints[i : i + 1]]
+                    if i not in matched_dets:
+                        self.cache_pos = np.vstack(
+                            [self.cache_pos, keypoints[i : i + 1]]
                         )
-                        self.descriptors = np.vstack(
-                            [self.descriptors, descriptors[i : i + 1]]
+                        self.cache_desc = np.vstack(
+                            [self.cache_desc, descriptors[i : i + 1]]
                         )
-                        self.last_seen = np.append(self.last_seen, current_time)
+                        self.cache_time = np.append(self.cache_time, now)
+                        self.cache_stable = np.append(self.cache_stable, 1)
 
+            # Evict stale
             with profiler.section("evict"):
-                self.evict_stale(current_time)
+                keep = (now - self.cache_time) < STALE_SEC
+                if np.sum(keep) < len(self.cache_pos):
+                    self.cache_pos = self.cache_pos[keep]
+                    self.cache_desc = self.cache_desc[keep]
+                    self.cache_time = self.cache_time[keep]
+                    self.cache_stable = self.cache_stable[keep]
 
-            if len(matched_detected) == 0:
-                return np.zeros((0, 2), dtype=np.float32), np.zeros(
-                    (0, 2), dtype=np.float32
-                )
+            if len(detected) == 0:
+                return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
 
-            return np.array(matched_detected, dtype=np.float32), np.array(
-                matched_tracked, dtype=np.float32
-            )
+            return np.array(detected, np.float32), np.array(tracked, np.float32)
 
-    def evict_stale(self, current_time):
-        """Remove features not seen recently."""
-        if self.last_seen is None:
-            return
-
-        age = current_time - self.last_seen
-        keep_mask = age < STALE_THRESHOLD_SEC
-
-        if np.sum(keep_mask) > MAX_CACHE_SIZE:
-            sorted_indices = np.argsort(-self.last_seen)
-            keep_indices = sorted_indices[:MAX_CACHE_SIZE]
-            keep_mask = np.zeros(len(self.last_seen), dtype=bool)
-            keep_mask[keep_indices] = True
-
-        if np.sum(keep_mask) < len(self.positions):
-            self.positions = self.positions[keep_mask]
-            self.descriptors = self.descriptors[keep_mask]
-            self.last_seen = self.last_seen[keep_mask]
+    def _init_cache(self, keypoints, descriptors, now):
+        self.cache_pos = keypoints.copy()
+        self.cache_desc = descriptors.copy() if descriptors is not None else None
+        self.cache_time = np.full(len(keypoints), now)
+        self.cache_stable = np.ones(len(keypoints), dtype=np.int32)
 
     def reset(self):
-        """Clear all cached features."""
-        self.positions = None
-        self.descriptors = None
-        self.last_seen = None
-
-    @staticmethod
-    def calculate_alpha(dt, rc_milliseconds):
-        """Calculate smoothing alpha from time constant."""
-        if rc_milliseconds <= 0:
-            return 1.0
-        rc_seconds = rc_milliseconds / 1000.0
-        return 1.0 - np.exp(-dt / rc_seconds)
+        self.cache_pos = None
+        self.cache_desc = None
+        self.cache_time = None
+        self.cache_stable = None

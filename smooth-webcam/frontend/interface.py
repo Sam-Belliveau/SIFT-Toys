@@ -8,13 +8,15 @@ import cv2
 
 # === PARAMETERS ===
 WINDOW_NAME = "RBF Warp"
+WINDOW_WIDTH = 640
+WINDOW_HEIGHT = 480
 
-MAX_FEATURES_DEFAULT = 64
-MAX_FEATURES_MAX = 200
+MAX_FEATURES_DEFAULT = 500
+MAX_FEATURES_MAX = 1000
 MIN_FEATURES = 4
 
-FILTER_RC_DEFAULT = 200
-FILTER_RC_MAX = 1000
+FILTER_RC_DEFAULT = 500
+FILTER_RC_MAX = 2000
 
 
 def nothing(x):
@@ -23,7 +25,9 @@ def nothing(x):
 
 def setup():
     """Create window and trackbars."""
-    cv2.namedWindow(WINDOW_NAME)
+    # WINDOW_NORMAL allows resizing, WINDOW_KEEPRATIO maintains aspect
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.resizeWindow(WINDOW_NAME, WINDOW_WIDTH, WINDOW_HEIGHT)
 
     cv2.createTrackbar(
         "Max Features",

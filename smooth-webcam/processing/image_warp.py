@@ -8,7 +8,7 @@ Linear interpolation-based image warping using scipy Delaunay triangulation.
 
 import cv2
 import numpy as np
-from scipy.interpolate import LinearNDInterpolator
+from scipy.interpolate import LinearNDInterpolator, RBFInterpolator
 from profiler import profiler
 
 
@@ -32,7 +32,7 @@ def warp_image(
             return image
 
     with profiler.section("displacement"):
-        displacements = destination_points - source_points
+        displacements = source_points - destination_points
 
     with profiler.section("interpolator"):
         try:
@@ -42,11 +42,29 @@ def warp_image(
             )
             corner_disp = np.zeros((4, 2), dtype=np.float32)
 
-            all_points = np.vstack([source_points, corners])
+            all_points = np.vstack([destination_points, corners])
             all_disps = np.vstack([displacements, corner_disp])
 
-            interpolator = LinearNDInterpolator(all_points, all_disps, fill_value=0)
-        except Exception:
+            # Remove duplicate points (within 10 pixels) to avoid singular matrix
+            _, unique_indices = np.unique(
+                (all_points / 10).astype(np.int32),
+                axis=0,
+                return_index=True,
+            )
+            all_points = all_points[unique_indices]
+            all_disps = all_disps[unique_indices]
+
+            if len(all_points) < 4:
+                return image
+
+            interpolator = RBFInterpolator(
+                all_points,
+                all_disps,
+                kernel="multiquadric",
+                epsilon=500.0,
+            )
+        except Exception as e:
+            print(f"Interpolator failed: {e}")
             return image
 
     with profiler.section("build_grid"):

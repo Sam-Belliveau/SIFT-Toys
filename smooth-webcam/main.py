@@ -8,7 +8,7 @@ import time
 import cv2
 
 from frontend import video_capture, interface, display
-from sift.detector import SIFTDetector
+from sift.detector import ORBDetector
 from processing import grayscale, image_warp, draw
 from processing.feature_tracker import FeatureTracker
 from profiler import profiler
@@ -28,7 +28,7 @@ def main():
     print("Press 'q' or ESC to quit, or close the window")
 
     camera = video_capture.get_stream()
-    sift = SIFTDetector()
+    orb = ORBDetector()
     tracker = FeatureTracker()
 
     interface.setup()
@@ -58,7 +58,7 @@ def main():
                 gray = grayscale.convert(small_frame)
 
             with profiler.section("sift"):
-                keypoints, descriptors = sift.detect(gray, max_features)
+                keypoints, descriptors = orb.detect(gray, max_features)
 
             if keypoints.shape[0] < MIN_FEATURES:
                 display.show(frame)
@@ -94,8 +94,12 @@ def main():
                 output = draw.draw_points(output, detected_full, COLOR_RED, radius=3)
                 output = draw.draw_points(output, tracked_full, COLOR_GREEN, radius=3)
 
+            # Resize for smaller display window
+            with profiler.section("resize_output"):
+                output_small = cv2.resize(output, (640, 480))
+
             with profiler.section("display"):
-                if not display.show(output):
+                if not display.show(output_small):
                     break
 
             profiler.report()
