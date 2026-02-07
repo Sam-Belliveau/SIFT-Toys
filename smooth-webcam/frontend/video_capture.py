@@ -2,27 +2,51 @@
 Video Capture
 Uses: nothing
 Used by: main.py
+
+Async capture: background thread grabs frames so main loop never blocks.
 """
 
 import cv2
+import threading
 
 # === PARAMETERS ===
 DEVICE_INDEX = 0
 
 
+class AsyncCamera:
+    def __init__(self, device_index=DEVICE_INDEX):
+        self.cap = cv2.VideoCapture(device_index)
+        self.frame = None
+        self.grabbed = False
+        self.lock = threading.Lock()
+        self.running = True
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def _reader(self):
+        while self.running:
+            grabbed, frame = self.cap.read()
+            with self.lock:
+                self.grabbed = grabbed
+                self.frame = frame
+
+    def read(self):
+        with self.lock:
+            return self.frame.copy() if self.grabbed else None
+
+    def release(self):
+        self.running = False
+        self.thread.join()
+        self.cap.release()
+
+
 def get_stream():
-    """Open webcam and return camera handle."""
-    return cv2.VideoCapture(DEVICE_INDEX)
+    return AsyncCamera()
 
 
 def get_frame(camera):
-    """Grab a single frame from camera. Returns None if invalid."""
-    valid, frame = camera.read()
-    if not valid:
-        return None
-    return frame
+    return camera.read()
 
 
 def release(camera):
-    """Release camera resources."""
     camera.release()

@@ -1,7 +1,7 @@
 """
 Smooth Webcam - Optical Flow Feature Tracking
 
-Main orchestrator with downsampling for performance.
+Main orchestrator. Reads all tunable values from the global params registry.
 """
 
 import time
@@ -12,10 +12,10 @@ from frontend import video_capture, interface
 from processing import grayscale, image_warp, draw
 from processing.feature_tracker import FeatureTracker
 from profiler import profiler
+from params import params
 
 # === PARAMETERS ===
 MIN_FEATURES = 4
-DOWNSAMPLE_FACTOR = 4
 
 COLOR_RED = (0, 0, 255)
 COLOR_GREEN = (0, 255, 0)
@@ -23,7 +23,7 @@ COLOR_WHITE = (255, 255, 255)
 
 
 def main():
-    print(f"Running on CPU with {DOWNSAMPLE_FACTOR}x downsampling")
+    print("Running on CPU with async capture")
 
     camera = video_capture.get_stream()
     tracker = FeatureTracker()
@@ -46,14 +46,13 @@ def main():
         with profiler.section("capture"):
             frame = video_capture.get_frame(camera)
             if frame is None:
-                app.quit()
                 return
 
-        max_features, rc_ms = interface.read_params()
+        downsample = params["downsample"]
 
         with profiler.section("downsample"):
             h, w = frame.shape[:2]
-            small_h, small_w = h // DOWNSAMPLE_FACTOR, w // DOWNSAMPLE_FACTOR
+            small_h, small_w = h // downsample, w // downsample
             small_frame = cv2.resize(frame, (small_w, small_h))
 
         with profiler.section("grayscale"):
@@ -63,8 +62,8 @@ def main():
             detected, tracked = tracker.update(
                 gray,
                 dt,
-                rc_ms,
-                max_features,
+                params["filter_rc_ms"],
+                params["max_features"],
             )
 
         if detected.shape[0] < MIN_FEATURES:
@@ -84,8 +83,8 @@ def main():
             warped = cv2.resize(warped_small, (w, h))
 
         with profiler.section("scale_points"):
-            detected_full = detected * DOWNSAMPLE_FACTOR
-            tracked_full = tracked * DOWNSAMPLE_FACTOR
+            detected_full = detected * downsample
+            tracked_full = tracked * downsample
 
         with profiler.section("draw"):
             output = draw.draw_lines(

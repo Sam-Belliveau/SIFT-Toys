@@ -3,13 +3,16 @@ Image Warp (CPU)
 Uses: profiler
 Used by: main.py
 
-Linear interpolation-based image warping using scipy Delaunay triangulation.
+RBF displacement field evaluated on coarse grid, upsampled with bicubic.
 """
 
 import cv2
 import numpy as np
-from scipy.interpolate import LinearNDInterpolator, RBFInterpolator
+from scipy.interpolate import RBFInterpolator
 from profiler import profiler
+from params import params
+
+FLOW_DOWNSAMPLE = 8
 
 
 def warp_image(
@@ -17,14 +20,6 @@ def warp_image(
     source_points,
     destination_points,
 ):
-    """
-    Warp image using linear interpolation displacement field.
-
-    Args:
-        image: HxWxC uint8 numpy array
-        source_points: Nx2 array (y, x) - detected positions
-        destination_points: Nx2 array (y, x) - tracked positions
-    """
     h, w = image.shape[:2]
 
     with profiler.section("nan_check"):
@@ -36,7 +31,6 @@ def warp_image(
 
     with profiler.section("interpolator"):
         try:
-            # Add corners to ensure full coverage
             corners = np.array(
                 [[0, 0], [0, w - 1], [h - 1, 0], [h - 1, w - 1]], dtype=np.float32
             )
@@ -45,7 +39,6 @@ def warp_image(
             all_points = np.vstack([destination_points, corners])
             all_disps = np.vstack([displacements, corner_disp])
 
-            # Remove duplicate points (within 10 pixels) to avoid singular matrix
             _, unique_indices = np.unique(
                 (all_points / 10).astype(np.int32),
                 axis=0,
@@ -61,22 +54,40 @@ def warp_image(
                 all_points,
                 all_disps,
                 kernel="multiquadric",
-                epsilon=1.0,
+                epsilon=params["rbf_epsilon"],
             )
         except Exception as e:
             print(f"Interpolator failed: {e}")
             return image
 
     with profiler.section("build_grid"):
-        grid_y, grid_x = np.mgrid[0:h, 0:w]
-        grid = np.stack((grid_y, grid_x), axis=-1).reshape(-1, 2).astype(np.float32)
+        coarse_y, coarse_x = np.mgrid[0:h:FLOW_DOWNSAMPLE, 0:w:FLOW_DOWNSAMPLE]
+        small_h, small_w = coarse_y.shape
+        coarse_grid = (
+            np.stack((coarse_y, coarse_x), axis=-1).reshape(-1, 2).astype(np.float32)
+        )
 
     with profiler.section("interp_eval"):
-        flow = interpolator(grid).reshape((h, w, 2)).astype(np.float32)
+        coarse_flow = (
+            interpolator(coarse_grid).reshape((small_h, small_w, 2)).astype(np.float32)
+        )
+
+    with profiler.section("upsample_flow"):
+        flow_y = cv2.resize(
+            coarse_flow[:, :, 0],
+            (w, h),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        flow_x = cv2.resize(
+            coarse_flow[:, :, 1],
+            (w, h),
+            interpolation=cv2.INTER_CUBIC,
+        )
 
     with profiler.section("sample_coords"):
-        sample_y = (grid_y + flow[:, :, 0]).astype(np.float32)
-        sample_x = (grid_x + flow[:, :, 1]).astype(np.float32)
+        grid_y, grid_x = np.mgrid[0:h, 0:w]
+        sample_y = (grid_y + flow_y).astype(np.float32)
+        sample_x = (grid_x + flow_x).astype(np.float32)
 
     with profiler.section("remap"):
         warped = cv2.remap(

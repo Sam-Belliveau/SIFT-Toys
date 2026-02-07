@@ -10,7 +10,7 @@ from profiler import profiler
 
 # === PARAMETERS ===
 MAX_CORNERS = 1000
-CORNER_QUALITY = 0.05
+CORNER_QUALITY = 0.01
 CORNER_MIN_DIST = 5
 BLOCK_SIZE = 7
 
@@ -42,6 +42,11 @@ class FeatureTracker:
         max_features=MAX_CORNERS,
     ):
         alpha = 1.0 - np.exp(-dt / (rc_ms / 1000.0)) if rc_ms > 0 else 1.0
+
+        if self.prev_gray is not None and self.prev_gray.shape != gray.shape:
+            self.prev_gray = None
+            self.raw_points = None
+            self.smooth_points = None
 
         if self.prev_gray is None:
             with profiler.section("detect"):
