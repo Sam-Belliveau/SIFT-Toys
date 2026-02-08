@@ -9,7 +9,7 @@ processing modules read from it. Import and use directly:
 """
 
 params = {
-    "max_features": 500,
+    "grid_points": 500,
     "filter_rc_ms": 500,
     "downsample": 4,
     "rbf_smoothing": 0,

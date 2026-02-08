@@ -56,7 +56,7 @@ STYLE = """
 """
 
 SLIDERS = [
-    ("Max Features", "max_features", 10, 2500, 500, 1),
+    ("Grid Points", "grid_points", 10, 2500, 500, 1),
     ("Filter RC (ms)", "filter_rc_ms", 0, 2000, 500, 1),
     ("Downsample", "downsample", 1, 8, 4, 1),
     ("RBF Smoothing", "rbf_smoothing", 0, 1000, 0, 1),

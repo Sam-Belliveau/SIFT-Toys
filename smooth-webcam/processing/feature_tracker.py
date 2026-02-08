@@ -1,7 +1,8 @@
 """
 Feature Tracker (CPU)
 
-Lucas-Kanade optical flow tracking with exponential smoothing.
+Dense hexagonal grid optical flow with exponential smoothing.
+Grid points drift back to their original positions via EMA decay.
 """
 
 import numpy as np
@@ -9,11 +10,6 @@ import cv2
 from profiler import profiler
 
 # === PARAMETERS ===
-MAX_CORNERS = 1000
-CORNER_QUALITY = 0.01
-CORNER_MIN_DIST = 5
-BLOCK_SIZE = 7
-
 LK_WIN_SIZE = (21, 21)
 LK_MAX_LEVEL = 3
 LK_CRITERIA = (
@@ -23,94 +19,82 @@ LK_CRITERIA = (
 )
 
 BACKTRACK_THRESHOLD = 1.0
-REDETECT_INTERVAL = 10
-MIN_TRACK_COUNT = 20
+
+
+def generate_hexagonal_grid(height, width, n_samples):
+    """Generate evenly-spaced hexagonal grid points covering the image."""
+    ratio = (width / height) * np.sqrt(3) / 2
+
+    sw = int(np.ceil(np.sqrt(n_samples * ratio)))
+    sh = int(np.round(np.sqrt(n_samples / ratio)))
+
+    xs = np.round(np.linspace(0, width - 1, (2 * sw - 1) + 2, endpoint=True)[1:-1])
+    xs_even = xs[0::2]
+    xs_odd = xs[1::2]
+
+    ys = np.round(np.linspace(0, height - 1, sh + 2, endpoint=True)[1:-1])
+
+    xi = []
+    yi = []
+    for i, y in enumerate(ys):
+        row_xs = xs_even if i % 2 == 0 else xs_odd
+        xi.extend(row_xs)
+        yi.extend([y] * len(row_xs))
+
+    # Return as (N, 2) array in (y, x) format
+    return np.column_stack([yi, xi]).astype(np.float32)
 
 
 class FeatureTracker:
     def __init__(self):
         self.prev_gray = None
-        self.raw_points = None
-        self.smooth_points = None
-        self.frame_count = 0
+        self.grid_points = (
+            None  # original hex grid positions (y, x) — fixed destination
+        )
+        self.current_points = None  # LK-tracked, decaying toward grid (y, x) — source
+        self.n_samples = None
+        self.shape = None
+
+    def _init_grid(self, gray, n_samples):
+        h, w = gray.shape[:2]
+        self.grid_points = generate_hexagonal_grid(h, w, n_samples)
+        self.current_points = self.grid_points.copy()
+        self.n_samples = n_samples
+        self.shape = gray.shape[:2]
 
     def update(
         self,
         gray,
         dt,
         rc_ms,
-        max_features=MAX_CORNERS,
+        n_samples=500,
     ):
         alpha = 1.0 - np.exp(-dt / (rc_ms / 1000.0)) if rc_ms > 0 else 1.0
 
-        if self.prev_gray is not None and self.prev_gray.shape != gray.shape:
-            self.prev_gray = None
-            self.raw_points = None
-            self.smooth_points = None
+        needs_reinit = (
+            self.prev_gray is None
+            or self.shape != gray.shape[:2]
+            or self.n_samples != n_samples
+        )
 
-        if self.prev_gray is None:
+        if needs_reinit:
             with profiler.section("detect"):
-                self._detect(gray, max_features)
+                self._init_grid(gray, n_samples)
             self.prev_gray = gray
             return (
                 np.zeros((0, 2), np.float32),
                 np.zeros((0, 2), np.float32),
             )
 
-        self.frame_count += 1
-
         with profiler.section("optical_flow"):
-            raw, smooth = self._track(gray, alpha)
-
-        needs_redetect = (
-            self.frame_count % REDETECT_INTERVAL == 0
-            or len(self.raw_points) < MIN_TRACK_COUNT
-        )
-
-        if needs_redetect:
-            with profiler.section("redetect"):
-                self._add_new_points(gray, max_features)
+            self._track(gray, alpha)
 
         self.prev_gray = gray
-        return raw, smooth
+        return self.current_points.copy(), self.grid_points.copy()
 
-    def _detect(
-        self,
-        gray,
-        max_features,
-    ):
-        corners = cv2.goodFeaturesToTrack(
-            gray,
-            maxCorners=max_features,
-            qualityLevel=CORNER_QUALITY,
-            minDistance=CORNER_MIN_DIST,
-            blockSize=BLOCK_SIZE,
-        )
-
-        if corners is None:
-            self.raw_points = np.zeros((0, 2), np.float32)
-            self.smooth_points = np.zeros((0, 2), np.float32)
-            return
-
-        pts = corners.reshape(-1, 2)
-        # Convert (x, y) → (y, x) for consistency
-        pts = pts[:, ::-1].copy().astype(np.float32)
-        self.raw_points = pts
-        self.smooth_points = pts.copy()
-
-    def _track(
-        self,
-        gray,
-        alpha,
-    ):
-        if self.raw_points is None or len(self.raw_points) == 0:
-            return (
-                np.zeros((0, 2), np.float32),
-                np.zeros((0, 2), np.float32),
-            )
-
+    def _track(self, gray, alpha):
         # Points for LK need (x, y) shape (N, 1, 2)
-        prev_pts = self.raw_points[:, ::-1].reshape(-1, 1, 2).astype(np.float32)
+        prev_pts = self.current_points[:, ::-1].reshape(-1, 1, 2).astype(np.float32)
 
         with profiler.section("forward"):
             next_pts, status_fwd, _ = cv2.calcOpticalFlowPyrLK(
@@ -145,67 +129,23 @@ class FeatureTracker:
                 & (fb_error < BACKTRACK_THRESHOLD)
             )
 
-        if not np.any(valid):
-            self.raw_points = np.zeros((0, 2), np.float32)
-            self.smooth_points = np.zeros((0, 2), np.float32)
-            return (
-                np.zeros((0, 2), np.float32),
-                np.zeros((0, 2), np.float32),
-            )
-
-        with profiler.section("smooth"):
+        with profiler.section("decay"):
             # Convert tracked points back to (y, x)
-            new_raw = next_pts.reshape(-1, 2)[valid][:, ::-1].copy().astype(np.float32)
-            old_smooth = self.smooth_points[valid]
+            tracked = next_pts.reshape(-1, 2)[:, ::-1].copy().astype(np.float32)
 
-            new_smooth = alpha * new_raw + (1.0 - alpha) * old_smooth
+            # Valid points: follow LK result
+            # Invalid points: snap back to grid origin
+            self.current_points[valid] = tracked[valid]
+            self.current_points[~valid] = self.grid_points[~valid]
 
-            self.raw_points = new_raw
-            self.smooth_points = new_smooth
-
-        return self.raw_points.copy(), self.smooth_points.copy()
-
-    def _add_new_points(
-        self,
-        gray,
-        max_features,
-    ):
-        existing_count = len(self.raw_points) if self.raw_points is not None else 0
-        needed = max_features - existing_count
-
-        if needed <= 0:
-            return
-
-        mask = np.full(gray.shape[:2], 255, dtype=np.uint8)
-
-        if self.raw_points is not None and len(self.raw_points) > 0:
-            for pt in self.raw_points:
-                y, x = int(pt[0]), int(pt[1])
-                cv2.circle(mask, (x, y), int(CORNER_MIN_DIST), 0, -1)
-
-        corners = cv2.goodFeaturesToTrack(
-            gray,
-            maxCorners=needed,
-            qualityLevel=CORNER_QUALITY,
-            minDistance=CORNER_MIN_DIST,
-            blockSize=BLOCK_SIZE,
-            mask=mask,
-        )
-
-        if corners is None:
-            return
-
-        new_pts = corners.reshape(-1, 2)[:, ::-1].copy().astype(np.float32)
-
-        if self.raw_points is not None and len(self.raw_points) > 0:
-            self.raw_points = np.vstack([self.raw_points, new_pts])
-            self.smooth_points = np.vstack([self.smooth_points, new_pts])
-        else:
-            self.raw_points = new_pts
-            self.smooth_points = new_pts.copy()
+            # Decay toward grid — when motion stops, points relax back
+            self.current_points = (
+                1.0 - alpha
+            ) * self.current_points + alpha * self.grid_points
 
     def reset(self):
         self.prev_gray = None
-        self.raw_points = None
-        self.smooth_points = None
-        self.frame_count = 0
+        self.grid_points = None
+        self.current_points = None
+        self.n_samples = None
+        self.shape = None

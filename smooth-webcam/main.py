@@ -63,7 +63,7 @@ def main():
                 gray,
                 dt,
                 params["filter_rc_ms"],
-                params["max_features"],
+                params["grid_points"],
             )
 
         if detected.shape[0] < MIN_FEATURES:
@@ -122,8 +122,9 @@ def main():
             flow_vis = cv2.resize(flow_bgr, (w, h), interpolation=cv2.INTER_NEAREST)
 
         with profiler.section("display"):
+            gray_bgr = cv2.cvtColor(cv2.resize(gray, (w, h)), cv2.COLOR_GRAY2BGR)
             top = np.hstack([frame, output])
-            bottom = np.hstack([flow_vis, flow_vis])
+            bottom = np.hstack([gray_bgr, flow_vis])
             combined = np.vstack([top, bottom])
             interface.show_frame(combined)
             interface.process_events()
