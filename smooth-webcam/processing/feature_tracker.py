@@ -173,7 +173,7 @@ class FeatureTracker:
                 )
                 target = self.grid_points.copy()
                 target[self.interior_mask] = neighbor_mean
-                self.current_points = 0.5 * self.current_points + 0.5 * target
+                self.current_points = target
 
     def reset(self):
         self.prev_gray = None
