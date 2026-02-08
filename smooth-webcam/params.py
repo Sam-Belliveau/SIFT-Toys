@@ -12,6 +12,7 @@ params = {
     "max_features": 500,
     "filter_rc_ms": 500,
     "downsample": 4,
-    "rbf_epsilon": 1.0,
+    "rbf_smoothing": 0,
+    "bilateral_sigma": 25,
     "point_opacity": 50,
 }

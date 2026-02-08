@@ -21,10 +21,11 @@ def warp_image(
     destination_points,
 ):
     h, w = image.shape[:2]
+    empty_flow = np.zeros((h, w, 2), dtype=np.float32)
 
     with profiler.section("nan_check"):
         if np.any(np.isnan(source_points)) or np.any(np.isnan(destination_points)):
-            return image
+            return image, empty_flow
 
     with profiler.section("displacement"):
         displacements = source_points - destination_points
@@ -48,17 +49,18 @@ def warp_image(
             all_disps = all_disps[unique_indices]
 
             if len(all_points) < 4:
-                return image
+                return image, empty_flow
 
             interpolator = RBFInterpolator(
                 all_points,
                 all_disps,
                 kernel="multiquadric",
-                epsilon=params["rbf_epsilon"],
+                epsilon=500,
+                smoothing=params["rbf_smoothing"],
             )
         except Exception as e:
             print(f"Interpolator failed: {e}")
-            return image
+            return image, empty_flow
 
     with profiler.section("build_grid"):
         coarse_y, coarse_x = np.mgrid[0:h:FLOW_DOWNSAMPLE, 0:w:FLOW_DOWNSAMPLE]
@@ -84,6 +86,27 @@ def warp_image(
             interpolation=cv2.INTER_CUBIC,
         )
 
+    with profiler.section("bilateral"):
+        d = params["bilateral_sigma"]
+        if d > 0:
+            d = d | 1  # ensure odd
+            sigma = d / 2.0
+            guide = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            flow_y = cv2.ximgproc.jointBilateralFilter(
+                guide,
+                flow_y,
+                d=d,
+                sigmaColor=sigma,
+                sigmaSpace=sigma,
+            )
+            flow_x = cv2.ximgproc.jointBilateralFilter(
+                guide,
+                flow_x,
+                d=d,
+                sigmaColor=sigma,
+                sigmaSpace=sigma,
+            )
+
     with profiler.section("sample_coords"):
         grid_y, grid_x = np.mgrid[0:h, 0:w]
         sample_y = (grid_y + flow_y).astype(np.float32)
@@ -98,4 +121,5 @@ def warp_image(
             borderMode=cv2.BORDER_REPLICATE,
         )
 
-    return warped
+    flow = np.stack([flow_y, flow_x], axis=-1)
+    return warped, flow

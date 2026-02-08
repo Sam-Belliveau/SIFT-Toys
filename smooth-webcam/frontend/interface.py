@@ -56,10 +56,11 @@ STYLE = """
 """
 
 SLIDERS = [
-    ("Max Features", "max_features", 10, 1000, 500, 1),
+    ("Max Features", "max_features", 10, 2500, 500, 1),
     ("Filter RC (ms)", "filter_rc_ms", 0, 2000, 500, 1),
     ("Downsample", "downsample", 1, 8, 4, 1),
-    ("RBF Epsilon", "rbf_epsilon", 1, 500, 1, 1),
+    ("RBF Smoothing", "rbf_smoothing", 0, 1000, 0, 1),
+    ("Bilateral Sigma", "bilateral_sigma", 0, 100, 25, 1),
     ("Point Opacity %", "point_opacity", 0, 100, 50, 1),
 ]
 

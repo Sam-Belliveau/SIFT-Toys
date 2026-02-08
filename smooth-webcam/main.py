@@ -73,7 +73,7 @@ def main():
             return
 
         with profiler.section("warp"):
-            warped_small = image_warp.warp_image(
+            warped_small, flow_small = image_warp.warp_image(
                 small_frame,
                 detected,
                 tracked,
@@ -106,8 +106,25 @@ def main():
                 radius=3,
             )
 
+        with profiler.section("flow_viz"):
+            flow_y = flow_small[:, :, 0]
+            flow_x = flow_small[:, :, 1]
+            mag = np.sqrt(flow_x**2 + flow_y**2)
+            ang = np.arctan2(flow_y, flow_x)
+
+            hsv = np.zeros((*flow_small.shape[:2], 3), dtype=np.uint8)
+            hsv[..., 0] = ((ang + np.pi) / (2 * np.pi) * 179).astype(np.uint8)
+            hsv[..., 1] = 255
+            max_mag = max(mag.max(), 1e-5)
+            hsv[..., 2] = np.clip(mag / max_mag * 255, 0, 255).astype(np.uint8)
+
+            flow_bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+            flow_vis = cv2.resize(flow_bgr, (w, h), interpolation=cv2.INTER_NEAREST)
+
         with profiler.section("display"):
-            combined = np.hstack([frame, output])
+            top = np.hstack([frame, output])
+            bottom = np.hstack([flow_vis, flow_vis])
+            combined = np.vstack([top, bottom])
             interface.show_frame(combined)
             interface.process_events()
 
