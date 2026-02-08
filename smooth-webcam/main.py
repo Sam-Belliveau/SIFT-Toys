@@ -87,6 +87,12 @@ def main():
             tracked_full = tracked * downsample
 
         with profiler.section("draw"):
+            output = draw.draw_points(
+                warped,
+                tracked_full,
+                COLOR_GREEN,
+                radius=1,
+            )
             output = draw.draw_lines(
                 warped,
                 detected_full,
@@ -94,15 +100,9 @@ def main():
                 COLOR_WHITE,
             )
             output = draw.draw_points(
-                output,
+                warped,
                 detected_full,
                 COLOR_RED,
-                radius=3,
-            )
-            output = draw.draw_points(
-                output,
-                tracked_full,
-                COLOR_GREEN,
                 radius=3,
             )
 

@@ -60,7 +60,6 @@ SLIDERS = [
     ("Filter RC (ms)", "filter_rc_ms", 0, 2000, 500, 1),
     ("Downsample", "downsample", 1, 8, 4, 1),
     ("RBF Smoothing", "rbf_smoothing", 0, 1000, 0, 1),
-    ("Bilateral Sigma", "bilateral_sigma", 0, 100, 25, 1),
     ("Point Opacity %", "point_opacity", 0, 100, 50, 1),
 ]
 

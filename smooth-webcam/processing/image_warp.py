@@ -86,27 +86,6 @@ def warp_image(
             interpolation=cv2.INTER_CUBIC,
         )
 
-    with profiler.section("bilateral"):
-        d = params["bilateral_sigma"]
-        if d > 0:
-            d = d | 1  # ensure odd
-            sigma = d / 2.0
-            guide = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            flow_y = cv2.ximgproc.jointBilateralFilter(
-                guide,
-                flow_y,
-                d=d,
-                sigmaColor=sigma,
-                sigmaSpace=sigma,
-            )
-            flow_x = cv2.ximgproc.jointBilateralFilter(
-                guide,
-                flow_x,
-                d=d,
-                sigmaColor=sigma,
-                sigmaSpace=sigma,
-            )
-
     with profiler.section("sample_coords"):
         grid_y, grid_x = np.mgrid[0:h, 0:w]
         sample_y = (grid_y + flow_y).astype(np.float32)

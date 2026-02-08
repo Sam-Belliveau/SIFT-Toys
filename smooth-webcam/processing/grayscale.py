@@ -27,7 +27,7 @@ def convert(image):
     gray_sq_blur = cv2.GaussianBlur(np.square(gray), ksize, sigmaX=10)
 
     variance = gray_sq_blur - np.square(gray_blur)
-    std = np.sqrt(variance + 4)
+    std = np.sqrt(variance + 16)
 
     norm_gray = (gray - gray_blur) / std
     return np.clip(40 * norm_gray + 128, 0, 255).astype(np.uint8)
