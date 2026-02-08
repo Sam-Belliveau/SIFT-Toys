@@ -10,7 +10,7 @@ processing modules read from it. Import and use directly:
 
 params = {
     "grid_points": 500,
-    "filter_rc_ms": 500,
+    "decay_iters": 4,
     "downsample": 4,
     "rbf_smoothing": 0,
     "point_opacity": 50,

@@ -1,12 +1,13 @@
 """
 Feature Tracker (CPU)
 
-Dense hexagonal grid optical flow with exponential smoothing.
-Grid points drift back to their original positions via EMA decay.
+Dense hexagonal grid optical flow with Laplacian relaxation.
+Interior points decay toward their neighbor average; edge points decay to grid.
 """
 
 import numpy as np
 import cv2
+from scipy.spatial import KDTree
 from profiler import profiler
 
 # === PARAMETERS ===
@@ -45,6 +46,31 @@ def generate_hexagonal_grid(height, width, n_samples):
     return np.column_stack([yi, xi]).astype(np.float32)
 
 
+def build_hex_neighbors(grid_points):
+    """Build vectorized neighbor structure for hexagonal grid.
+
+    Returns:
+        interior_mask: bool array (N,) — True for points with exactly 6 neighbors
+        interior_neighbor_idx: int array (N_interior, 6) — neighbor indices for interior points
+    """
+    tree = KDTree(grid_points)
+    dists, _ = tree.query(grid_points, k=2)  # k=2: self + nearest
+    spacing = np.median(dists[:, 1])
+    radius = spacing * 1.2
+
+    neighbors = tree.query_ball_tree(tree, r=radius)
+
+    interior_mask = np.array([len(nbrs) - 1 == 6 for nbrs in neighbors])  # -1 for self
+    # Build (N_interior, 6) index array
+    interior_indices = np.where(interior_mask)[0]
+    interior_neighbor_idx = np.empty((len(interior_indices), 6), dtype=np.int32)
+    for k, i in enumerate(interior_indices):
+        nbrs = [j for j in neighbors[i] if j != i]
+        interior_neighbor_idx[k] = nbrs
+
+    return interior_mask, interior_neighbor_idx
+
+
 class FeatureTracker:
     def __init__(self):
         self.prev_gray = None
@@ -54,6 +80,8 @@ class FeatureTracker:
         self.current_points = None  # LK-tracked, decaying toward grid (y, x) — source
         self.n_samples = None
         self.shape = None
+        self.interior_mask = None  # bool (N,): True = 6 neighbors
+        self.interior_neighbor_idx = None  # int (N_interior, 6)
 
     def _init_grid(self, gray, n_samples):
         h, w = gray.shape[:2]
@@ -61,16 +89,16 @@ class FeatureTracker:
         self.current_points = self.grid_points.copy()
         self.n_samples = n_samples
         self.shape = gray.shape[:2]
+        self.interior_mask, self.interior_neighbor_idx = build_hex_neighbors(
+            self.grid_points
+        )
 
     def update(
         self,
         gray,
-        dt,
-        rc_ms,
+        decay_iters=4,
         n_samples=500,
     ):
-        alpha = 1.0 - np.exp(-dt / (rc_ms / 1000.0)) if rc_ms > 0 else 1.0
-
         needs_reinit = (
             self.prev_gray is None
             or self.shape != gray.shape[:2]
@@ -87,12 +115,12 @@ class FeatureTracker:
             )
 
         with profiler.section("optical_flow"):
-            self._track(gray, alpha)
+            self._track(gray, decay_iters)
 
         self.prev_gray = gray
         return self.current_points.copy(), self.grid_points.copy()
 
-    def _track(self, gray, alpha):
+    def _track(self, gray, decay_iters):
         # Points for LK need (x, y) shape (N, 1, 2)
         prev_pts = self.current_points[:, ::-1].reshape(-1, 1, 2).astype(np.float32)
 
@@ -138,10 +166,14 @@ class FeatureTracker:
             self.current_points[valid] = tracked[valid]
             self.current_points[~valid] = self.grid_points[~valid]
 
-            # Decay toward grid — when motion stops, points relax back
-            self.current_points = (
-                1.0 - alpha
-            ) * self.current_points + alpha * self.grid_points
+            # Laplacian relaxation: run multiple iterations
+            for _ in range(decay_iters):
+                neighbor_mean = self.current_points[self.interior_neighbor_idx].mean(
+                    axis=1
+                )
+                target = self.grid_points.copy()
+                target[self.interior_mask] = neighbor_mean
+                self.current_points = 0.5 * self.current_points + 0.5 * target
 
     def reset(self):
         self.prev_gray = None
@@ -149,3 +181,5 @@ class FeatureTracker:
         self.current_points = None
         self.n_samples = None
         self.shape = None
+        self.interior_mask = None
+        self.interior_neighbor_idx = None

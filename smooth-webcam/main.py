@@ -61,8 +61,7 @@ def main():
         with profiler.section("tracking"):
             detected, tracked = tracker.update(
                 gray,
-                dt,
-                params["filter_rc_ms"],
+                params["decay_iters"],
                 params["grid_points"],
             )
 
